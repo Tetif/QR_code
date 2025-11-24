@@ -144,320 +144,155 @@ def find_qr_corners(finders: List[np.ndarray], img_shape: Tuple[int, int] = None
     """Находит углы QR-кода по трём позиционным меткам.
     Возвращает точки в порядке: TL, TR, BR, BL (float32).
     
-    Использует внешние углы finder patterns для точного определения границ QR-кода.
+    Алгоритм работает как OpenCV: использует внешние углы finder patterns и расширяет их наружу.
     """
     if len(finders) < 3:
         raise ValueError("Need at least 3 finder patterns")
 
-    # Вычисляем центры и размеры всех найденных меток
-    # Пытаемся найти дочерние контуры (внутренние черные квадраты) для более точного определения углов
-    finder_info = []
-    
-    # Если есть доступ к bin_img, ищем дочерние контуры
-    inner_contours = {}
-    if bin_img is not None:
-        contours, hierarchy = cv2.findContours(bin_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        if hierarchy is not None:
-            for i, finder in enumerate(finders):
-                # Находим индекс этого контура в списке всех контуров
-                for j, contour in enumerate(contours):
-                    if cv2.matchShapes(finder, contour, cv2.CONTOURS_MATCH_I2, 0) < 0.1:
-                        # Нашли соответствующий контур, проверяем дочерний
-                        if hierarchy[0][j][2] != -1:
-                            child_idx = hierarchy[0][j][2]
-                            if child_idx != -1 and child_idx < len(contours):
-                                inner_contours[i] = contours[child_idx]
-                                break
-    
-    for i, finder in enumerate(finders):
+    # Шаг 1: Подготовка данных о finder patterns
+    finder_data = []
+    for finder in finders:
         x, y, w, h = cv2.boundingRect(finder)
         center = calculate_center(finder)
-        
-        # Используем внутренний контур (дочерний), если он есть, иначе внешний
-        contour_to_use = inner_contours.get(i, finder)
-        
-        finder_info.append({
-            'contour': finder,  # Внешний контур (для справки)
-            'inner_contour': contour_to_use,  # Внутренний контур (черный квадрат)
+        contour_points = finder.reshape(-1, 2).astype(float)
+
+        finder_data.append({
+            'contour': finder,
+            'contour_points': contour_points,
             'center': center,
             'bbox': (x, y, w, h),
-            'size': max(w, h)  # Размер finder pattern
+            'size': max(w, h)
         })
 
-    # Находим три самые удаленные метки (вероятные углы QR-кода)
-    if len(finders) == 3:
-        selected_finders = finder_info
+    # Шаг 2: Выбираем 3 finder patterns (если их больше)
+    if len(finder_data) == 3:
+        selected = finder_data
     else:
         # Выбираем три самые удаленные друг от друга
-        centers = [f['center'] for f in finder_info]
+        centers = np.array([f['center'] for f in finder_data], dtype='float32')
         distances = []
         for i in range(len(centers)):
             for j in range(i + 1, len(centers)):
-                dist = np.linalg.norm(np.array(centers[i]) - np.array(centers[j]))
+                dist = np.linalg.norm(centers[i] - centers[j])
                 distances.append((i, j, dist))
 
         distances.sort(key=lambda x: x[2], reverse=True)
         selected_indices = set()
-        for i, j, dist in distances[:3]:
+        for i, j, _ in distances:
             selected_indices.add(i)
             selected_indices.add(j)
             if len(selected_indices) >= 3:
                 break
 
-        selected_finders = [finder_info[i] for i in list(selected_indices)[:3]]
+        selected = [finder_data[i] for i in list(selected_indices)[:3]]
 
-    # Для каждой finder pattern находим внешний угол QR-кода
-    # Важно: используем края черного квадрата, а не белую область вокруг
-    corners_list = []
-    for finder in selected_finders:
-        # Используем внутренний контур (черный квадрат), если он есть
-        # Это даст нам точные края черного квадрата без белой области
-        inner_contour = finder.get('inner_contour', finder['contour'])
-        outer_contour = finder['contour']
-        
-        x, y, w, h = finder['bbox']
-        center = finder['center']
-        
-        # Предпочитаем использовать внутренний контур (дочерний)
-        # Если внутренний контур есть и достаточно большой, используем его
-        if 'inner_contour' in finder and inner_contour is not outer_contour:
-            inner_area = cv2.contourArea(inner_contour)
-            outer_area = cv2.contourArea(outer_contour)
-            # Используем внутренний контур, если его площадь составляет хотя бы 30% от внешнего
-            if inner_area > outer_area * 0.3:
-                contour_to_use = inner_contour
-            else:
-                contour_to_use = outer_contour
-        else:
-            # Если внутреннего контура нет, используем внешний, но сдвигаем внутрь
-            contour_to_use = outer_contour
-        
-        contour_points = contour_to_use.reshape(-1, 2).astype(float)
-        
-        # Находим угловые точки, но используем ближайшие к центру в каждом направлении
-        # Это даст нам края черного квадрата, а не белой области
-        tl_point = None
-        tr_point = None
-        bl_point = None
-        br_point = None
-        
-        min_dist_tl = float('inf')
-        min_dist_tr = float('inf')
-        min_dist_bl = float('inf')
-        min_dist_br = float('inf')
-        
-        # Находим точки контура в каждом квадранте, которые ближе всего к центру
-        # Это будут края черного квадрата (внутренние края контура)
-        relative_points = contour_points - center
-        
-        for pt, rel_pt in zip(contour_points, relative_points):
-            dist = np.linalg.norm(rel_pt)
-            # Квадрант определяется знаками x и y относительно центра
-            if rel_pt[0] <= 0 and rel_pt[1] <= 0:  # Левый верхний квадрант
-                # Ищем точку, которая ближе к центру, но все еще в этом квадранте
-                # Это будет внутренний край черного квадрата
-                if dist < min_dist_tl and dist > 0:
-                    min_dist_tl = dist
-                    tl_point = pt
-            elif rel_pt[0] >= 0 and rel_pt[1] <= 0:  # Правый верхний квадрант
-                if dist < min_dist_tr and dist > 0:
-                    min_dist_tr = dist
-                    tr_point = pt
-            elif rel_pt[0] <= 0 and rel_pt[1] >= 0:  # Левый нижний квадрант
-                if dist < min_dist_bl and dist > 0:
-                    min_dist_bl = dist
-                    bl_point = pt
-            else:  # Правый нижний квадрант
-                if dist < min_dist_br and dist > 0:
-                    min_dist_br = dist
-                    br_point = pt
-        
-        # Если не нашли точки (маловероятно), используем альтернативный метод
-        # Используем точки, которые находятся на определенном расстоянии от центра
-        # (примерно 70-80% от максимального расстояния - это будет край черного квадрата)
-        if tl_point is None or tr_point is None or bl_point is None or br_point is None:
-            # Находим максимальное расстояние от центра
-            max_dist = max([np.linalg.norm(pt - center) for pt in contour_points])
-            target_dist = max_dist * 0.75  # 75% от максимального - край черного квадрата
-            
-            # Ищем точки, которые ближе всего к target_dist в каждом квадранте
-            for pt, rel_pt in zip(contour_points, relative_points):
-                dist = np.linalg.norm(rel_pt)
-                diff = abs(dist - target_dist)
-                
-                if rel_pt[0] <= 0 and rel_pt[1] <= 0:  # TL
-                    if tl_point is None or abs(np.linalg.norm(tl_point - center) - target_dist) > diff:
-                        tl_point = pt
-                elif rel_pt[0] >= 0 and rel_pt[1] <= 0:  # TR
-                    if tr_point is None or abs(np.linalg.norm(tr_point - center) - target_dist) > diff:
-                        tr_point = pt
-                elif rel_pt[0] <= 0 and rel_pt[1] >= 0:  # BL
-                    if bl_point is None or abs(np.linalg.norm(bl_point - center) - target_dist) > diff:
-                        bl_point = pt
-                else:  # BR
-                    if br_point is None or abs(np.linalg.norm(br_point - center) - target_dist) > diff:
-                        br_point = pt
-        
-        # Финальный fallback: используем углы bounding rect, но сдвинутые внутрь
-        # Сдвигаем на 10-15% внутрь, чтобы исключить белую область
-        shrink_factor = 0.12  # Сдвигаем на 12% внутрь
-        if tl_point is None:
-            tl_point = np.array([x + w * shrink_factor, y + h * shrink_factor], dtype='float32')
-        else:
-            tl_point = tl_point.astype('float32')
-        if tr_point is None:
-            tr_point = np.array([x + w * (1 - shrink_factor), y + h * shrink_factor], dtype='float32')
-        else:
-            tr_point = tr_point.astype('float32')
-        if bl_point is None:
-            bl_point = np.array([x + w * shrink_factor, y + h * (1 - shrink_factor)], dtype='float32')
-        else:
-            bl_point = bl_point.astype('float32')
-        if br_point is None:
-            br_point = np.array([x + w * (1 - shrink_factor), y + h * (1 - shrink_factor)], dtype='float32')
-        else:
-            br_point = br_point.astype('float32')
-        
-        corners_list.append({
-            'tl': tl_point,
-            'tr': tr_point,
-            'bl': bl_point,
-            'br': br_point,
-            'center': center
-        })
+    # Шаг 3: Определяем позиции finder patterns (TL, TR, BL)
+    centers = np.array([f['center'] for f in selected], dtype='float32')
 
-    # Улучшенное определение позиции каждой finder pattern
-    centers_array = np.array([f['center'] for f in corners_list], dtype='float32')
-    
-    # Используем более точный алгоритм определения углов
-    # 1. Находим центр всех finder patterns
-    center_all = np.mean(centers_array, axis=0)
-    
-    # 2. Определяем углы относительно центра
-    angles = []
-    for i, center in enumerate(centers_array):
-        vec = center - center_all
-        # Вычисляем угол от центра (atan2 дает угол от -pi до pi)
-        angle = np.arctan2(vec[1], vec[0])
-        angles.append((i, angle, center))
-    
-    # 3. Сортируем по углу (от -pi до pi)
-    angles.sort(key=lambda x: x[1])
-    
-    # 4. Определяем позиции: TL (верхний левый), TR (верхний правый), BL (нижний левый)
-    # Углы должны быть примерно: TL ~ -135°, TR ~ -45°, BL ~ 135°
-    # Но из-за поворота QR-кода углы могут быть любыми
-    # Используем сумму координат для определения TL (минимальная)
-    sum_coords = centers_array.sum(axis=1)
+    # TL: минимальная сумма координат (x + y минимальна)
+    sum_coords = centers.sum(axis=1)
     tl_idx = np.argmin(sum_coords)
-    
-    # Остальные два - по углу относительно TL
-    remaining = [i for i in range(len(centers_array)) if i != tl_idx]
-    if len(remaining) == 2:
+    tl_center = centers[tl_idx]
+
+    # Остальные два
+    remaining = [i for i in range(len(centers)) if i != tl_idx]
+
+    if len(remaining) >= 2:
         # Вычисляем углы относительно TL
-        tl_center = centers_array[tl_idx]
-        vec1 = centers_array[remaining[0]] - tl_center
-        vec2 = centers_array[remaining[1]] - tl_center
-        
-        # Определяем, какой из них TR (более горизонтальный) и BL (более вертикальный)
-        angle1 = np.arctan2(vec1[1], vec1[0])
-        angle2 = np.arctan2(vec2[1], vec2[0])
-        
-        # TR должен быть справа от TL (угол ближе к 0°)
-        # BL должен быть снизу от TL (угол ближе к 90°)
-        if abs(angle1) < abs(angle2):
+        vec1 = centers[remaining[0]] - tl_center
+        vec2 = centers[remaining[1]] - tl_center
+
+        # Более горизонтальный (меньше |dy/dx|) - это TR
+        # Более вертикальный (больше |dy/dx|) - это BL
+        angle1 = abs(vec1[1] / vec1[0]) if vec1[0] != 0 else float('inf')
+        angle2 = abs(vec2[1] / vec2[0]) if vec2[0] != 0 else float('inf')
+
+        if angle1 < angle2:
             tr_idx = remaining[0]
             bl_idx = remaining[1]
         else:
             tr_idx = remaining[1]
             bl_idx = remaining[0]
     else:
-        # Fallback на старый метод
-        diff_coords = np.diff(centers_array, axis=1)
-        tr_idx = np.argmin(diff_coords[:, 0]) if len(diff_coords) > 0 else 1
-        bl_idx = np.argmax(diff_coords[:, 0]) if len(diff_coords) > 0 else 2
-    
-    # Получаем углы finder patterns
-    tl_finder = corners_list[tl_idx]
-    tr_finder = corners_list[tr_idx]
-    bl_finder = corners_list[bl_idx]
-    
-    # Используем внешние углы finder patterns
-    # Для TL finder pattern используем TL угол
-    # Для TR finder pattern используем TR угол
-    # Для BL finder pattern используем BL угол
-    tl = tl_finder['tl']
-    tr = tr_finder['tr']
-    bl = bl_finder['bl']
-    
-    # Вычисляем четвертый угол (BR) более точно
-    # Используем параллелограмм: BR = TL + (TR - TL) + (BL - TL)
-    # Или: BR = TR + (BL - TL)
-    br = tr + (bl - tl)
-    
-    # Дополнительная проверка: если BR слишком далеко, используем альтернативный метод
-    # Вычисляем расстояние от TL до TR и от TL до BL
-    dist_tr = np.linalg.norm(tr - tl)
-    dist_bl = np.linalg.norm(bl - tl)
-    
-    # Если BR слишком близко к другим углам, пересчитываем
-    dist_br_tr = np.linalg.norm(br - tr)
-    dist_br_bl = np.linalg.norm(br - bl)
-    
-    # Если расстояния не соответствуют ожидаемым, используем альтернативный расчет
-    if dist_br_tr < dist_bl * 0.5 or dist_br_bl < dist_tr * 0.5:
-        # Альтернативный метод: используем геометрию прямоугольника
-        # Находим вектор от TL к TR и от TL к BL
-        vec_horizontal = tr - tl
-        vec_vertical = bl - tl
-        # BR = TL + vec_horizontal + vec_vertical
-        br = tl + vec_horizontal + vec_vertical
+        tr_idx = remaining[0] if len(remaining) > 0 else 1
+        bl_idx = remaining[1] if len(remaining) > 1 else 2
 
-    # Расширяем углы наружу, чтобы захватить весь QR-код
-    # Вычисляем средний размер finder patterns и расстояние между ними
-    avg_size = np.mean([f['size'] for f in selected_finders])
-    
-    # Вычисляем расстояния между finder patterns для оценки размера QR-кода
-    distances_between = []
-    for i in range(len(centers_array)):
-        for j in range(i + 1, len(centers_array)):
-            dist = np.linalg.norm(centers_array[i] - centers_array[j])
-            distances_between.append(dist)
-    avg_distance = np.mean(distances_between) if distances_between else avg_size * 10
-    max_distance = max(distances_between) if distances_between else avg_size * 10
-    
-    # Расширяем на основе размера finder pattern и расстояния между ними
-    # Finder pattern занимает примерно 7x7 модулей, а весь QR-код может быть 21-40 модулей
-    # Расширяем достаточно сильно, чтобы захватить весь QR-код
-    # Используем максимальное расстояние между finder patterns как ориентир
-    expansion_factor = 0.15  # 15% от максимального расстояния
-    expansion = max(avg_size * 0.8, max_distance * expansion_factor)  # Минимум 80% размера finder pattern
+    # Шаг 4: Находим углы QR-кода
+    # Используем точки контура finder patterns, которые находятся дальше всего от центра QR
+    # в нужных направлениях, и расширяем их минимально
 
-    # Расширяем каждый угол от центра QR-кода
-    center = np.mean([tl, tr, bl, br], axis=0)
-    
-    def expand_point(pt, center, expansion):
-        """Расширяет точку от центра на заданное расстояние"""
-        direction = pt - center
-        dist = np.linalg.norm(direction)
+    qr_center = np.mean(centers, axis=0)
+    avg_size = np.mean([f['size'] for f in selected])
+
+    def find_qr_corner_from_finder(finder_info, finder_center, qr_center, direction):
+        """Находит угол QR-кода из контура finder pattern в заданном направлении"""
+        contour_points = finder_info['contour_points']
+
+        # Нормализуем направление
+        direction = np.array(direction, dtype=float)
+        direction = direction / (np.linalg.norm(direction) + 1e-6)
+
+        # Ищем точку контура, которая находится дальше всего в нужном направлении от центра QR
+        best_point = None
+        best_score = -float('inf')
+
+        for pt in contour_points:
+            vec = pt - qr_center
+            dist = np.linalg.norm(vec)
+            if dist < 1e-6:
+                continue
+
+            vec_norm = vec / dist
+            # Скалярное произведение показывает, насколько точка в нужном направлении
+            score = np.dot(vec_norm, direction) * dist
+
+            if score > best_score:
+                best_score = score
+                best_point = pt
+
+        # Fallback: используем центр finder pattern
+        if best_point is None:
+            best_point = finder_center
+
+        return best_point.astype('float32')
+
+    # Находим углы из контуров finder patterns
+    tl = find_qr_corner_from_finder(selected[tl_idx], centers[tl_idx], qr_center, [-1, -1])
+    tr = find_qr_corner_from_finder(selected[tr_idx], centers[tr_idx], qr_center, [1, -1])
+    bl = find_qr_corner_from_finder(selected[bl_idx], centers[bl_idx], qr_center, [-1, 1])
+
+    # Шаг 5: Вычисляем четвертый угол (BR) используя геометрию параллелограмма
+    vec_horizontal = tr - tl
+    vec_vertical = bl - tl
+    br = tl + vec_horizontal + vec_vertical
+
+    # Шаг 6: Минимальное расширение наружу от центра QR-кода
+    # Расширяем только немного, чтобы углы были точно на краю QR-кода
+    # Используем небольшое расширение на основе размера finder pattern
+    expansion = 0  # 25% размера finder pattern - минимальное расширение
+
+    def expand_from_qr_center(corner, qr_center, expansion):
+        """Расширяет угол от центра QR-кода наружу"""
+        vec = corner - qr_center
+        dist = np.linalg.norm(vec)
         if dist > 0:
-            return pt + direction * (expansion / dist)
-        return pt
-    
-    tl_expanded = expand_point(tl, center, expansion)
-    tr_expanded = expand_point(tr, center, expansion)
-    bl_expanded = expand_point(bl, center, expansion)
-    br_expanded = expand_point(br, center, expansion)
-    
-    # Дополнительно: убеждаемся, что углы не выходят за границы изображения
+            return corner + vec * (expansion / dist)
+        return corner
+
+    tl = expand_from_qr_center(tl, qr_center, expansion)
+    tr = expand_from_qr_center(tr, qr_center, expansion)
+    bl = expand_from_qr_center(bl, qr_center, expansion)
+    br = expand_from_qr_center(br, qr_center, expansion)
+
+    # Шаг 7: Ограничиваем углы границами изображения
     if img_shape is not None:
         h, w = img_shape
-        tl_expanded = np.clip(tl_expanded, [0, 0], [w-1, h-1])
-        tr_expanded = np.clip(tr_expanded, [0, 0], [w-1, h-1])
-        bl_expanded = np.clip(bl_expanded, [0, 0], [w-1, h-1])
-        br_expanded = np.clip(br_expanded, [0, 0], [w-1, h-1])
+        tl = np.clip(tl, [0, 0], [w-1, h-1])
+        tr = np.clip(tr, [0, 0], [w-1, h-1])
+        bl = np.clip(bl, [0, 0], [w-1, h-1])
+        br = np.clip(br, [0, 0], [w-1, h-1])
 
-    return np.array([tl_expanded, tr_expanded, br_expanded, bl_expanded], dtype='float32')
+    return np.array([tl, tr, br, bl], dtype='float32')
 
 
 def expand_corners(corners: np.ndarray, expansion: float = 0.1) -> np.ndarray:
@@ -489,17 +324,17 @@ def perspective_transform(img: np.ndarray, src_pts: np.ndarray, output_size: int
 def create_clean_qr_image(warped_gray: np.ndarray, dimension: int, output_size: int = None) -> np.ndarray:
     """
     Создает четкий бинаризованный QR-код заданного размера.
-    
+
     Args:
         warped_gray: Выровненное grayscale изображение QR-кода
         dimension: Размерность QR-кода в модулях (21, 25, 29, и т.д.)
         output_size: Размер выходного изображения в пикселях (по умолчанию dimension * 10)
-    
+
     Returns:
         Бинаризованное изображение QR-кода (0 = черный, 255 = белый)
     """
     if output_size is None:
-        output_size = dimension * 10  # 10 пикселей на модуль по умолчанию
+        output_size = dimension * 1  # 10 пикселей на модуль по умолчанию
     
     # Усиление контраста
     if np.std(warped_gray) < 40:
